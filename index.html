@@ -57,7 +57,23 @@
             -webkit-user-select: none;
             -webkit-touch-callout: none;          /* iOS: 長押しメニューを出さない */
             -webkit-tap-highlight-color: transparent;
+            overscroll-behavior: none;            /* 引っ張りスクロール（バウンス）を抑止 */
+            -webkit-text-size-adjust: 100%;
         }
+        body {
+            position: fixed;                      /* iOS: ページ全体がずれる・スクロールするのを防ぐ */
+            inset: 0;
+        }
+        /* 操作部・ゲーム画面ではブラウザ標準のタッチ動作（ズーム・スクロール）をすべて無効化 */
+        #game-container, .control-panel, #game-field, canvas,
+        .joystick-base, .btn-action {
+            touch-action: none;
+            -webkit-user-select: none;
+            user-select: none;
+            -webkit-touch-callout: none;
+        }
+        /* タイトル画面などのボタンはダブルタップ拡大だけ無効化（タップは通常どおり） */
+        button { touch-action: manipulation; }
 
         #game-container {
             position: relative;
@@ -762,6 +778,9 @@
             if (!base || !thumb) return;
             base.addEventListener('pointerdown', (e) => {
                 e.preventDefault();
+                if (joystick.active) return; // 2本目の指は無視
+                // 指がスティックの外へ出ても追従し続けるよう、このポインタを捕捉
+                try { base.setPointerCapture(e.pointerId); } catch (err) {}
                 const rect = base.getBoundingClientRect();
                 joystick.originX = rect.left + rect.width / 2;
                 joystick.originY = rect.top + rect.height / 2;
@@ -789,10 +808,76 @@
         function setupActionBtnListener() {
             const btn = document.getElementById('btn-action');
             if (!btn) return;
-            btn.addEventListener('pointerdown', (e) => { e.preventDefault(); actionPressed = true; });
-            btn.addEventListener('pointerup', (e) => { e.preventDefault(); actionPressed = false; });
-            btn.addEventListener('pointerleave', (e) => { e.preventDefault(); actionPressed = false; });
-            btn.addEventListener('pointercancel', (e) => { e.preventDefault(); actionPressed = false; });
+            // 押している指をIDで管理する。指が少しボタンからはみ出しても離すまで射撃を続ける。
+            btn.addEventListener('pointerdown', (e) => {
+                e.preventDefault();
+                try { btn.setPointerCapture(e.pointerId); } catch (err) {}
+                firePointers.add(e.pointerId);
+                refreshAction();
+            });
+            const release = (e) => {
+                firePointers.delete(e.pointerId);
+                refreshAction();
+            };
+            btn.addEventListener('pointerup', release);
+            btn.addEventListener('pointercancel', release);
+            btn.addEventListener('lostpointercapture', release);
+        }
+
+        const firePointers = new Set();
+        let keyFire = false;
+        function refreshAction() {
+            actionPressed = firePointers.size > 0 || keyFire;
+        }
+
+        // アプリ切り替え・通知・画面ロックなどで指の「離した」が届かなかった場合に入力が残らないようにする
+        function resetAllInput() {
+            firePointers.clear();
+            keyFire = false;
+            refreshAction();
+            joystick.active = false; joystick.pointerId = null;
+            joystick.vectorX = 0; joystick.vectorY = 0;
+            const thumb = document.getElementById('joystick-thumb');
+            if (thumb) thumb.style.transform = 'translate(-50%, -50%)';
+            keys.up = keys.down = keys.left = keys.right = false;
+        }
+        window.addEventListener('blur', resetAllInput);
+        window.addEventListener('pagehide', resetAllInput);
+        document.addEventListener('visibilitychange', () => { if (document.hidden) resetAllInput(); });
+
+        // --- iOS対策: ピンチ拡大・ダブルタップ拡大・スクロールの抑止 ---
+        // iOSは user-scalable=no を無視するため、イベント側で止める。
+        // スティックとFIREを両手で同時に触ると「2本指=ピンチ」と判定されて拡大したり、
+        // 途中でタッチがキャンセルされたりするのを防ぐ。
+        ['gesturestart', 'gesturechange', 'gestureend'].forEach(type => {
+            document.addEventListener(type, (e) => e.preventDefault(), { passive: false });
+        });
+        document.addEventListener('touchmove', (e) => {
+            // タイトル画面の縦スクロール（小さい画面用）だけは許可
+            if (gameState === 'title' && e.touches.length === 1 && e.target.closest('#screen-title')) return;
+            e.preventDefault();
+        }, { passive: false });
+        document.addEventListener('touchstart', (e) => {
+            if (e.touches.length > 1 && gameState === 'title') e.preventDefault(); // タイトル画面のピンチ
+        }, { passive: false });
+        const gameContainerEl = document.getElementById('game-container');
+        ['touchstart', 'touchend'].forEach(type => {
+            gameContainerEl.addEventListener(type, (e) => {
+                if (e.target.closest('button')) return; // 結果画面の「タイトルへ戻る」は通常のタップ
+                e.preventDefault(); // ダブルタップ拡大・長押し選択を防ぐ（ポインタイベントは届く）
+            }, { passive: false });
+        });
+
+        // 万一拡大されてしまった場合の復帰（ベストエフォート）
+        if (window.visualViewport) {
+            const vpMeta = document.querySelector('meta[name="viewport"]');
+            const vpContent = vpMeta ? vpMeta.getAttribute('content') : '';
+            window.visualViewport.addEventListener('resize', () => {
+                if (window.visualViewport.scale > 1.01 && vpMeta) {
+                    vpMeta.setAttribute('content', vpContent + ', minimum-scale=1.0');
+                    setTimeout(() => vpMeta.setAttribute('content', vpContent), 50);
+                }
+            });
         }
 
         window.addEventListener('keydown', (e) => {
@@ -800,14 +885,14 @@
             if (['ArrowDown','s'].includes(e.key)) keys.down = true;
             if (['ArrowLeft','a'].includes(e.key)) keys.left = true;
             if (['ArrowRight','d'].includes(e.key)) keys.right = true;
-            if ([' ','Enter'].includes(e.key)) actionPressed = true;
+            if ([' ','Enter'].includes(e.key)) { keyFire = true; refreshAction(); }
         });
         window.addEventListener('keyup', (e) => {
             if (['ArrowUp','w'].includes(e.key)) keys.up = false;
             if (['ArrowDown','s'].includes(e.key)) keys.down = false;
             if (['ArrowLeft','a'].includes(e.key)) keys.left = false;
             if (['ArrowRight','d'].includes(e.key)) keys.right = false;
-            if ([' ','Enter'].includes(e.key)) actionPressed = false;
+            if ([' ','Enter'].includes(e.key)) { keyFire = false; refreshAction(); }
         });
 
         function spawnEnemy() {
